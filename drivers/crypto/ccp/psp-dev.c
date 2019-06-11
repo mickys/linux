@@ -1034,6 +1034,23 @@ void psp_pci_init(void)
 	if (sev_get_api_version())
 		goto err;
 
+
+	/*
+        * If platform is not in UNINIT state then firmware upgrade and/or
+        * platform INIT command will fail. These command require UNINIT state.
+        *
+        * In a normal boot we should never run into case where the firmware
+        * is not in UNINIT state on boot. But in case of kexec boot, a reboot
+        * may not go through a typical shutdown sequence and may leave the
+	* firmware in INIT or WORKING state.
+	*/
+
+	printk("*** DEBUG: %s:%u:%s - sp_master->sev_state %d\n", __FILE__, __LINE__, __func__, psp_master->sev_state);
+	if (psp_master->sev_state != SEV_STATE_UNINIT) {
+		sev_platform_shutdown(NULL);
+		psp_master->sev_state = SEV_STATE_UNINIT;
+        }
+
 	if (SEV_VERSION_GREATER_OR_EQUAL(0, 15) &&
 	    sev_update_firmware(psp_master->dev) == 0)
 		sev_get_api_version();
