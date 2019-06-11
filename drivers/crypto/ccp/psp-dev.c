@@ -41,6 +41,7 @@ MODULE_PARM_DESC(reset, " Perform PLATFORM_RESET before INIT (any non-zero value
 
 #define DEVICE_NAME	"sev"
 #define SEV_FW_FILE	"amd/sev.fw"
+#define SEV_FW_NAME_SIZE	64
 
 static DEFINE_MUTEX(sev_cmd_mutex);
 static struct sev_misc_dev *misc_dev;
@@ -168,6 +169,7 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 	struct psp_device *psp = psp_master;
 	unsigned int phys_lsb, phys_msb;
 	unsigned int reg, ret = 0;
+	char buffer [100];
 
 	if (!psp)
 		return -ENODEV;
@@ -179,11 +181,15 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 	phys_lsb = data ? lower_32_bits(__psp_pa(data)) : 0;
 	phys_msb = data ? upper_32_bits(__psp_pa(data)) : 0;
 
-	dev_dbg(psp->dev, "sev command id %#x buffer 0x%08x%08x timeout %us\n",
-		cmd, phys_msb, phys_lsb, psp_timeout);
 
-	print_hex_dump_debug("(in):  ", DUMP_PREFIX_OFFSET, 16, 2, data,
-			     sev_cmd_buffer_len(cmd), false);
+	printk("*** DEBUG: %s:%u:%s - sev command id %#x buffer 0x%08x%08x timeout %us\n", __FILE__, __LINE__, __func__,
+		cmd, phys_msb, phys_lsb, psp_timeout
+	);
+
+	sprintf(buffer, "*** DEBUG: %s:%u:%s - (in):  ", __FILE__, __LINE__, __func__);
+	print_hex_dump(KERN_INFO, buffer,
+	    DUMP_PREFIX_OFFSET, 16, 2, data, sev_cmd_buffer_len(cmd), false
+	);
 
 	iowrite32(phys_lsb, psp->io_regs + psp->vdata->cmdbuff_addr_lo_reg);
 	iowrite32(phys_msb, psp->io_regs + psp->vdata->cmdbuff_addr_hi_reg);
@@ -194,6 +200,9 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 	reg <<= PSP_CMDRESP_CMD_SHIFT;
 	reg |= PSP_CMDRESP_IOC;
 	dev_dbg(psp->dev, "sev mailbox protocol  cmd: 0x%08x\n", reg);
+
+	printk("*** DEBUG: %s:%u:%s - sev mailbox protocol  cmd: 0x%08x\n",  __FILE__, __LINE__, __func__, reg);
+
 	iowrite32(reg, psp->io_regs + psp->vdata->cmdresp_reg);
 
 	/* wait for command completion */
@@ -202,6 +211,7 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 		if (psp_ret)
 			*psp_ret = 0;
 
+		printk("*** DEBUG: %s:%u:%s - sev command %#x timed out, disabling PSP \n", __FILE__, __LINE__, __func__, cmd);
 		dev_err(psp->dev, "sev command %#x timed out, disabling PSP \n", cmd);
 		psp_dead = true;
 
@@ -210,17 +220,22 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 
 	psp_timeout = psp_cmd_timeout;
 
+	printk("*** DEBUG: %s:%u:%s - sev mailbox protocol  ret=%d, reg=%d \n",  __FILE__, __LINE__, __func__, ret, reg);
+
 	if (psp_ret)
 		*psp_ret = reg & PSP_CMDRESP_ERR_MASK;
 
 	if (reg & PSP_CMDRESP_ERR_MASK) {
+		printk("*** DEBUG: %s:%u:%s - sev command %#x failed (%#010x)\n", __FILE__, __LINE__, __func__,
+		    cmd, reg & PSP_CMDRESP_ERR_MASK
+		);
 		dev_dbg(psp->dev, "sev command %#x failed (%#010x)\n",
 			cmd, reg & PSP_CMDRESP_ERR_MASK);
 		ret = -EIO;
 	}
 
-	print_hex_dump_debug("(out): ", DUMP_PREFIX_OFFSET, 16, 2, data,
-			     sev_cmd_buffer_len(cmd), false);
+	sprintf(buffer, "*** DEBUG: %s:%u:%s - (out): ", __FILE__, __LINE__, __func__);
+	print_hex_dump(KERN_INFO, buffer, DUMP_PREFIX_OFFSET, 16, 2, data, sev_cmd_buffer_len(cmd), false );
 
 	return ret;
 }
@@ -271,6 +286,7 @@ static int __sev_platform_init_locked(int *error)
 
 	psp->sev_state = SEV_STATE_INIT;
 	dev_dbg(psp->dev, "SEV firmware initialized\n");
+	printk("*** DEBUG: %s:%u:%s - SEF firmware initialized\n", __FILE__, __LINE__, __func__);
 
 	return rc;
 }
@@ -297,6 +313,7 @@ static int __sev_platform_shutdown_locked(int *error)
 
 	psp_master->sev_state = SEV_STATE_UNINIT;
 	dev_dbg(psp_master->dev, "SEV firmware shutdown\n");
+	printk("*** DEBUG: %s:%u:%s - SEF firmware shutdown\n", __FILE__, __LINE__, __func__);
 
 	return ret;
 }
@@ -478,6 +495,52 @@ static int sev_get_api_version(void)
 	return 0;
 }
 
+static int sev_get_firmware(struct device *dev, const struct firmware **firmware)
+{
+    char fw_name_specific[SEV_FW_NAME_SIZE];
+    char fw_name_subset[SEV_FW_NAME_SIZE];
+
+    snprintf(fw_name_specific, sizeof(fw_name_specific),
+	 "amd/amd_sev_fam%.2xh_model%.2xh.sbin",
+	 boot_cpu_data.x86, boot_cpu_data.x86_model);
+
+    snprintf(fw_name_subset, sizeof(fw_name_subset),
+	 "amd/amd_sev_fam%.2xh_model%.1xxh.sbin",
+	 boot_cpu_data.x86, (boot_cpu_data.x86_model & 0xf0) >> 4);
+
+    /* Check for SEV FW for a particular model.
+     * Ex. amd_sev_fam17h_model00h.sbin for Family 17h Model 00h
+     *
+     * or
+     *
+     * Check for SEV FW common to a subset of models.
+     * Ex. amd_sev_fam17h_model0xh.sbin for
+     *     Family 17h Model 00h -- Family 17h Model 0Fh
+     *
+     * or
+     *
+     * Fall-back to using generic name: sev.fw
+     */
+
+     printk("*** DEBUG: %s:%u:%s - firmware_request_nowarn - fw_name_specific: %d", __FILE__, __LINE__, __func__,
+         firmware_request_nowarn(firmware, fw_name_specific, dev)
+     );
+     printk("*** DEBUG: %s:%u:%s - firmware_request_nowarn - fw_name_subset: %d", __FILE__, __LINE__, __func__,
+         firmware_request_nowarn(firmware, fw_name_subset, dev)
+     );
+     printk("*** DEBUG: %s:%u:%s - firmware_request_nowarn - SEV_FW_FILE: %d", __FILE__, __LINE__, __func__,
+         firmware_request_nowarn(firmware, SEV_FW_FILE, dev)
+     );
+
+    if ((firmware_request_nowarn(firmware, fw_name_specific, dev) >= 0) ||
+        (firmware_request_nowarn(firmware, fw_name_subset, dev) >= 0) ||
+        (firmware_request_nowarn(firmware, SEV_FW_FILE, dev) >= 0))
+	return 0;
+
+    return -ENOENT;
+}
+
+
 /* Don't fail if SEV FW couldn't be updated. Continue with existing SEV FW */
 static int sev_update_firmware(struct device *dev)
 {
@@ -487,9 +550,11 @@ static int sev_update_firmware(struct device *dev)
 	struct page *p;
 	u64 data_size;
 
-	ret = request_firmware(&firmware, SEV_FW_FILE, dev);
-	if (ret < 0)
+	if (sev_get_firmware(dev, &firmware) == -ENOENT) {
+		dev_dbg(dev, "No SEV firmware file present\n");
+		printk("*** DEBUG: %s:%u:%s - No SEV firmware file present\n", __FILE__, __LINE__, __func__);
 		return -1;
+	}
 
 	/*
 	 * SEV FW expects the physical address given to it to be 32
@@ -518,10 +583,14 @@ static int sev_update_firmware(struct device *dev)
 	data->len = firmware->size;
 
 	ret = sev_do_cmd(SEV_CMD_DOWNLOAD_FIRMWARE, data, &error);
-	if (ret)
+	if (ret) {
 		dev_dbg(dev, "Failed to update SEV firmware: %#x\n", error);
-	else
+		printk("*** DEBUG: %s:%u:%s - Failed to update SEV firmware: %#x\n", __FILE__, __LINE__, __func__, error);
+	}
+	else {
 		dev_info(dev, "SEV firmware update successful\n");
+		printk("*** DEBUG: %s:%u:%s - SEV firmware update successful\n", __FILE__, __LINE__, __func__);
+	}
 
 	__free_pages(p, order);
 
@@ -985,6 +1054,7 @@ void psp_pci_init(void)
 	rc = sev_platform_init(&error);
 	if (rc) {
 		dev_err(sp->dev, "SEV: failed to INIT error %#x\n", error);
+		printk("*** DEBUG: %s:%u:%s - SEV: failed to INIT error %#x\n", __FILE__, __LINE__, __func__, error);
 		goto err;
 	}
 
